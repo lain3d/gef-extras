@@ -342,3 +342,163 @@ emulate(uc, {start:#x}, {end:#x})
         if not kwargs.get("to_file", None):
             os.unlink(tmp_filename)
         return
+
+@register
+class TakeSnapshotCommand(GenericCommand):
+    """Use Unicorn-Engine to emulate the behavior of the binary, without affecting the GDB runtime.
+    By default the command will emulate only the next instruction, but location and number of
+    instruction can be changed via arguments to the command line. By default, it will emulate
+    the next instruction from current PC."""
+
+    _cmdline_ = "take-snapshot"
+    _syntax_ = (f"{_cmdline_} [--output PATH]"
+                "\nAdditional options can be setup via `gef config unicorn-emulate`")
+    _example_ = f"{_cmdline_} --output /tmp/"
+
+    def __init__(self) -> None:
+        super().__init__(complete=gdb.COMPLETE_LOCATION)
+        self["verbose"] = (False, "Set unicorn-engine in verbose mode")
+        self["show_disassembly"] = (False, "Show every instruction executed")
+        return
+
+    @only_if_gdb_running
+    # @parse_arguments({}, {"--output": ""})
+    @parse_arguments({}, {"--output": "", "--start" : "", "--end" : "", "--input_reg" : ""})
+    def do_invoke(self, _: List[str], **kwargs: Any) -> None:
+        args = kwargs["arguments"]
+        self.run_unicorn(output=args.output, start=args.start, end=args.end, input_reg=args.input_reg)
+        return
+
+    def run_unicorn(self, **kwargs: Any) -> None:
+        verbose = self["verbose"] or False
+        uc_arch, uc_mode, uc_endian = gef_to_uc_arch()
+        unicorn_registers = uc_registers(to_string=True)
+        cs_arch, cs_mode, cs_endian = gef_to_cs_arch()
+        fname = gef.session.file.name
+        output_path = kwargs.get("output", "/tmp")
+        start_arg = kwargs.get("start")
+        end_arg = kwargs.get("end")
+        input_reg_arg = kwargs.get("input_reg")
+        
+        emulate_segmentation_block = ""
+        context_segmentation_block = ""
+
+        pathlib.Path(output_path).mkdir(exist_ok=True)
+        fn = "snapshot.py"
+        to_file = os.path.join(output_path, fn)
+
+        tmp_filename = to_file
+        to_file = open(to_file, "w")
+        tmp_fd = to_file.fileno()
+
+        if is_x86():
+            # need to handle segmentation (and pagination) via MSR
+            emulate_segmentation_block = """
+# from https://github.com/unicorn-engine/unicorn/blob/master/tests/regress/x86_64_msr.py
+SCRATCH_ADDR = 0xf000
+SEGMENT_FS_ADDR = 0x5000
+SEGMENT_GS_ADDR = 0x6000
+FSMSR = 0xC0000100
+GSMSR = 0xC0000101
+
+def set_msr(uc, msr, value, scratch=SCRATCH_ADDR):
+    buf = b"\\x0f\\x30"  # x86: wrmsr
+    uc.mem_map(scratch, 0x1000)
+    uc.mem_write(scratch, buf)
+    uc.reg_write(unicorn.x86_const.UC_X86_REG_RAX, value & 0xFFFFFFFF)
+    uc.reg_write(unicorn.x86_const.UC_X86_REG_RDX, (value >> 32) & 0xFFFFFFFF)
+    uc.reg_write(unicorn.x86_const.UC_X86_REG_RCX, msr & 0xFFFFFFFF)
+    uc.emu_start(scratch, scratch+len(buf), count=1)
+    uc.mem_unmap(scratch, 0x1000)
+    return
+
+def set_gs(uc, addr):    return set_msr(uc, GSMSR, addr)
+def set_fs(uc, addr):    return set_msr(uc, FSMSR, addr)
+
+"""
+
+            context_segmentation_block = """
+    emu.mem_map(SEGMENT_FS_ADDR-0x1000, 0x3000)
+    set_fs(emu, SEGMENT_FS_ADDR)
+    set_gs(emu, SEGMENT_GS_ADDR)
+"""
+
+        content = """
+import collections
+import capstone, unicorn
+import qiling
+import os
+
+SNAPSHOT_START = {start}
+SNAPSHOT_END = [{end}]
+INPUT_REG = '{input_reg}'
+
+def reset(ql: qiling.Qiling):
+    dirname = os.path.dirname(__file__)
+{context_block}
+""".format(pythonbin=gef.session.constants["python3"], fname=fname,
+           regs=",".join(
+               [f"'{k.strip()}': {unicorn_registers[k]}" for k in unicorn_registers]),
+           verbose="True" if verbose else "False",
+           syscall_reg=gef.arch.syscall_register,
+           cs_arch=cs_arch, cs_mode=cs_mode, cs_endian=cs_endian,
+           ptrsize=gef.arch.ptrsize * 2 + 2,  # two hex chars per byte plus "0x" prefix
+           emu_block=emulate_segmentation_block if is_x86() else "",
+           arch=uc_arch, mode=uc_mode, endian=uc_endian,
+           context_block=context_segmentation_block if is_x86() else "",
+           start=start_arg,
+           end=end_arg,
+           input_reg=input_reg_arg)
+
+        if verbose:
+            info("Duplicating registers")
+
+        for r in reversed(gef.arch.all_registers):
+            gregval = gef.arch.register(r)
+            content += f"    ql.arch.regs.write({unicorn_registers[r]}, {gregval:#x})\n"
+
+        vmmap = gef.memory.maps
+        if not vmmap:
+            warn("An error occurred when reading memory map.")
+            return
+
+        if verbose:
+            info("Duplicating memory map")
+
+        for sect in vmmap:
+            if sect.path == "[vvar]":
+                # this section is for GDB only, skip it
+                continue
+
+            page_start = sect.page_start
+            page_end = sect.page_end
+            size = sect.size
+            perm = sect.permission
+            uc_perm = 0
+            if perm & Permission.READ:
+                uc_perm += 1
+            if perm & Permission.WRITE:
+                uc_perm += 2
+            if perm & Permission.EXECUTE:
+                uc_perm += 4
+
+            content += f"    # Mapping {sect.path}: {page_start:#x}-{page_end:#x}\n"
+            content += f"    ql.mem.map({page_start:#x}, {size:#x}, {uc_perm:#o})\n"
+
+            if perm & Permission.READ:
+                code = gef.memory.read(page_start, size)
+                loc = os.path.join(output_path, f"{output_path}/gef-{fname}-{page_start:#x}.raw")
+                loc_out = 'f"{dirname}/' + f"gef-{fname}-{page_start:#x}.raw" + '"'
+                with open(loc, "wb") as f:
+                    f.write(bytes(code))
+
+                content += f"    ql.mem.write({page_start:#x}, open({loc_out}, 'rb').read())\n"
+                content += "\n"
+
+        os.write(tmp_fd, gef_pybytes(content))
+        os.close(tmp_fd)
+
+        
+        info(f"Snapshot script generated as '{tmp_filename}'")
+        os.chmod(tmp_filename, 0o700)
+        return
